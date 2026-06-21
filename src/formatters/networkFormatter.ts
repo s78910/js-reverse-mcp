@@ -126,11 +126,23 @@ export async function getShortDescriptionForRequestAsync(
   selectedInDevToolsUI = false,
   includeSetCookieMarker = false,
 ): Promise<string> {
+  if (!hasFinishedOrFailed(request)) {
+    return getShortDescriptionForRequest(request, id, selectedInDevToolsUI);
+  }
+
   const status = await getStatusFromRequestAsync(request);
   const setCookieMarker = includeSetCookieMarker
     ? await getSetCookieListMarker(request)
     : '';
   return `reqid=${id} ${getFormattedRequestTimingBrief(request)} [${request.resourceType()}] ${request.method()} ${getUrlForList(request.url())} ${status}${setCookieMarker}${selectedInDevToolsUI ? ` [selected in the DevTools Network panel]` : ''}`;
+}
+
+function hasFinishedOrFailed(request: HTTPRequest): boolean {
+  if (request.failure()) {
+    return true;
+  }
+
+  return isAvailableTiming(request.timing().responseEnd);
 }
 
 export function getFormattedRequestTimingBrief(request: HTTPRequest): string {

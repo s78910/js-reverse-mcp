@@ -9,8 +9,10 @@ import {test} from 'node:test';
 
 import {
   getFormattedHeaderEntries,
+  getShortDescriptionForRequestAsync,
   headersContainSensitiveValues,
 } from '../../src/formatters/networkFormatter.js';
+import type {HTTPRequest} from '../../src/third_party/index.js';
 
 test('redacts sensitive inline header values', () => {
   const lines = getFormattedHeaderEntries([
@@ -41,5 +43,33 @@ test('does not treat Set-Cookie as a redacted generic header', () => {
   assert.equal(
     headersContainSensitiveValues([{name: 'Set-Cookie', value: 'sid=abc'}]),
     false,
+  );
+});
+
+test('formats pending request list entries without waiting for a response', async () => {
+  const request = {
+    failure: () => null,
+    method: () => 'POST',
+    resourceType: () => 'xhr',
+    response: () => {
+      throw new Error('response() should not be called for pending requests');
+    },
+    timing: () => ({
+      startTime: -1,
+      domainLookupStart: -1,
+      domainLookupEnd: -1,
+      connectStart: -1,
+      secureConnectionStart: -1,
+      connectEnd: -1,
+      requestStart: -1,
+      responseStart: -1,
+      responseEnd: -1,
+    }),
+    url: () => 'https://example.test/api',
+  } as unknown as HTTPRequest;
+
+  assert.equal(
+    await getShortDescriptionForRequestAsync(request, 7, false, true),
+    'reqid=7 [time unavailable, pending] [xhr] POST https://example.test/api [pending]',
   );
 });
