@@ -11,6 +11,7 @@ import {
   exportNetworkRequestPart,
   getFormattedHeaderEntries,
   getFormattedResponseBody,
+  getFormattedSetCookieEntries,
   getShortDescriptionForRequestAsync,
   getStatusFromRequestAsync,
   headersContainSensitiveValues,
@@ -51,6 +52,18 @@ test('does not treat Set-Cookie as a redacted generic header', () => {
   assert.equal(
     headersContainSensitiveValues([{name: 'Set-Cookie', value: 'sid=abc'}]),
     false,
+  );
+});
+
+test('formats Set-Cookie entries as name=value and omits long values', () => {
+  const longValue = 'x'.repeat(513);
+
+  assert.deepEqual(
+    getFormattedSetCookieEntries([
+      'sid=abc123; Path=/; HttpOnly',
+      `risk=${longValue}; Path=/; Secure`,
+    ]),
+    ['2 entries', '- sid=abc123', '- risk=<omitted; value length 513 chars>'],
   );
 });
 
