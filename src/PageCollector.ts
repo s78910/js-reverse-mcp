@@ -130,6 +130,62 @@ export const stableIdSymbol = Symbol('stableIdSymbol');
 export const networkRequestObservedAtSymbol = Symbol(
   'networkRequestObservedAtSymbol',
 );
+
+/**
+ * Caches the response body buffer eagerly captured at `requestfinished` time,
+ * before a subsequent navigation lets the browser evict it. Stored as a
+ * Promise so concurrent readers dedupe onto a single capture. Lives on the
+ * request object, so it is GC'd together with the request when its navigation
+ * bucket is dropped.
+ */
+export const responseBodyCacheSymbol = Symbol('responseBodyCacheSymbol');
+
+/**
+ * Resolved size in bytes of the cached response body that was counted against
+ * the per-page budget. Read synchronously when a request is evicted, so its
+ * bytes can be reclaimed from the budget.
+ */
+const responseBodySizeSymbol = Symbol('responseBodySizeSymbol');
+
+export type CachedResponseBody =
+  | {ok: true; buffer: Buffer}
+  | {ok: false; error: string}
+  | {ok: 'skipped'; reason: string};
+
+/**
+ * Per-response size cap. Responses larger than this are not cached (they would
+ * dominate memory); reads fall back to a live fetch instead.
+ */
+export const MAX_CACHED_BODY_BYTES = 5 * 1024 * 1024;
+
+/**
+ * Per-page total budget for cached response bodies. Once exceeded, further
+ * responses are marked skipped rather than cached.
+ */
+export const MAX_CACHED_TOTAL_BYTES = 50 * 1024 * 1024;
+
+/**
+ * Upper bound on retained network request records per page. The network
+ * collector keeps a single flat FIFO queue (navigation-agnostic): once the
+ * queue exceeds this cap the oldest request is evicted, and evicting a record
+ * also reclaims its cached body bytes from the per-page budget so that budget is
+ * a rolling window rather than a one-way ratchet. The analyst establishes a
+ * clean baseline on demand via clear_network_requests, not via navigation — so
+ * this is a memory backstop, not the workflow.
+ */
+const MAX_RETAINED_REQUESTS = 5000;
+
+const BODY_CAPTURE_TIMEOUT_MS = 5000;
+
+/**
+ * Upper bound on retained per-page initiator entries, sized to match the request
+ * queue cap so an in-queue request still finds its initiator: initiators are
+ * recorded on a different CDP event than the request record, so the two FIFOs
+ * trim in lockstep rather than one stranding the other. Bounded by a FIFO cap
+ * (oldest dropped first) and wiped wholesale by clear_network_requests.
+ */
+const MAX_INITIATOR_ENTRIES = 5000;
+
 type WithSymbolId<T> = T & {
   [stableIdSymbol]?: number;
 };
@@ -197,12 +253,7 @@ export class PageCollector<T> {
     const listeners = this.#listenersInitializer(value => {
       const withId = value as WithSymbolId<T>;
       withId[stableIdSymbol] = idGenerator();
-
-      const navigations = this.storage.get(page) ?? [[]];
-      navigations[0].push(withId);
-      if (navigations[0].length > this.#maxItemsPerNavigation) {
-        navigations[0].shift();
-      }
+      this.store(page, withId);
     });
 
     listeners['framenavigated'] = (frame: Frame) => {
@@ -218,6 +269,19 @@ export class PageCollector<T> {
     }
 
     this.#listeners.set(page, listeners);
+  }
+
+  /**
+   * Append a collected item to the page's storage. Default implementation keeps
+   * the bucketed-by-navigation model (current bucket capped at
+   * #maxItemsPerNavigation). NetworkCollector overrides this with a flat FIFO.
+   */
+  protected store(page: Page, withId: WithSymbolId<T>): void {
+    const navigations = this.storage.get(page) ?? [[]];
+    navigations[0].push(withId);
+    if (navigations[0].length > this.#maxItemsPerNavigation) {
+      navigations[0].shift();
+    }
   }
 
   protected splitAfterNavigation(page: Page) {
@@ -251,7 +315,12 @@ export class PageCollector<T> {
     }
 
     const data: T[] = [];
-    for (let index = this.#maxNavigationSaved; index >= 0; index--) {
+    // Return every retained navigation bucket, not a fixed window. Collectors
+    // that trim on navigation (e.g. console) stay bounded; the network
+    // collector keeps all buckets until the page closes, so a request stays
+    // reachable as long as its object is alive — which is also what the eagerly
+    // cached response body relies on.
+    for (let index = navigations.length - 1; index >= 0; index--) {
       if (navigations[index]) {
         data.push(...navigations[index]);
       }
@@ -516,10 +585,101 @@ const cdpRequestIdSymbol = Symbol('cdpRequestId');
 type RequestWithNetworkMetadata = HTTPRequest & {
   [cdpRequestIdSymbol]?: string;
   [networkRequestObservedAtSymbol]?: number;
+  [responseBodyCacheSymbol]?: Promise<CachedResponseBody>;
+  [responseBodySizeSymbol]?: number;
 };
 
+/**
+ * Per-page running total of cached response body bytes. Keyed weakly so it is
+ * released when the page is GC'd; also cleared explicitly on page destroy.
+ */
+const responseBodyBudget = new WeakMap<Page, {bytes: number}>();
+
+function pageForRequest(req: HTTPRequest): Page | undefined {
+  try {
+    // frame() can throw for service worker requests.
+    return req.frame()?.page();
+  } catch {
+    return undefined;
+  }
+}
+
+function withCaptureTimeout<T>(promise: Promise<T>): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) =>
+      setTimeout(
+        () => reject(new Error('Timed out capturing response body')),
+        BODY_CAPTURE_TIMEOUT_MS,
+      ),
+    ),
+  ]);
+}
+
+/**
+ * Eagerly fetch and cache a response body while the producing loader is still
+ * alive (called from `requestfinished`). After a navigation the browser evicts
+ * the body and a later `body()` call would fail; the cache lets inspect/export
+ * still return it. Fire-and-forget: the Promise is stored on the request so
+ * concurrent readers await the same capture.
+ */
+function captureResponseBody(req: HTTPRequest): void {
+  const request = req as RequestWithNetworkMetadata;
+  if (request[responseBodyCacheSymbol]) {
+    return;
+  }
+  request[responseBodyCacheSymbol] = (async (): Promise<CachedResponseBody> => {
+    try {
+      const resp = await req.response();
+      if (!resp) {
+        return {ok: false, error: 'No response available'};
+      }
+      const declared = Number(resp.headers()['content-length'] ?? 0);
+      if (declared > MAX_CACHED_BODY_BYTES) {
+        return {
+          ok: 'skipped',
+          reason: `content-length ${declared} exceeds cache limit`,
+        };
+      }
+      const buffer = await withCaptureTimeout(resp.body());
+      if (buffer.length > MAX_CACHED_BODY_BYTES) {
+        return {
+          ok: 'skipped',
+          reason: `body ${buffer.length} bytes exceeds cache limit`,
+        };
+      }
+      const page = pageForRequest(req);
+      if (page) {
+        const budget = responseBodyBudget.get(page) ?? {bytes: 0};
+        if (budget.bytes + buffer.length > MAX_CACHED_TOTAL_BYTES) {
+          return {ok: 'skipped', reason: 'page cache budget exhausted'};
+        }
+        budget.bytes += buffer.length;
+        responseBodyBudget.set(page, budget);
+        // Record the counted size so eviction can reclaim it from the budget.
+        request[responseBodySizeSymbol] = buffer.length;
+      }
+      return {ok: true, buffer};
+    } catch (error) {
+      return {
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  })();
+}
+
+function initiatorKey(url: string, method: string): string {
+  return `${method} ${url}`;
+}
+
 export class NetworkCollector extends PageCollector<HTTPRequest> {
+  // Initiators keyed by CDP requestId. Requires cdpRequestIdSymbol to have been
+  // mapped onto the request, which races against event delivery.
   #initiators = new WeakMap<Page, Map<string, RequestInitiator>>();
+  // Initiators keyed by "METHOD url". Order-independent fallback used when the
+  // requestId mapping lost the race, so the initiator is still recoverable.
+  #initiatorsByKey = new WeakMap<Page, Map<string, RequestInitiator>>();
   #cdpListeners = new WeakMap<Page, () => void>();
   #sessionProvider: CdpSessionProvider;
   #cdpReady = false;
@@ -531,19 +691,28 @@ export class NetworkCollector extends PageCollector<HTTPRequest> {
       collector: (item: HTTPRequest) => void,
     ) => ListenerMap<PageEvents>,
   ) {
-    super(
-      context,
+    const baseListeners =
       listeners ??
-        (collect => {
-          return {
-            request: req => {
-              const request = req as RequestWithNetworkMetadata;
-              request[networkRequestObservedAtSymbol] = Date.now();
-              collect(req);
-            },
-          } as ListenerMap;
-        }),
-    );
+      (collect => {
+        return {
+          request: req => {
+            const request = req as RequestWithNetworkMetadata;
+            request[networkRequestObservedAtSymbol] = Date.now();
+            collect(req);
+          },
+        } as ListenerMap;
+      });
+    // Always capture the response body at requestfinished — before a navigation
+    // can evict it — regardless of which listeners variant is supplied.
+    super(context, collect => {
+      const map = baseListeners(collect);
+      const existingFinished = map.requestfinished;
+      map.requestfinished = req => {
+        captureResponseBody(req);
+        existingFinished?.(req);
+      };
+      return map;
+    });
     this.#sessionProvider = sessionProvider;
   }
 
@@ -577,6 +746,8 @@ export class NetworkCollector extends PageCollector<HTTPRequest> {
 
     const initiatorMap = new Map<string, RequestInitiator>();
     this.#initiators.set(page, initiatorMap);
+    const initiatorByKey = new Map<string, RequestInitiator>();
+    this.#initiatorsByKey.set(page, initiatorByKey);
 
     try {
       const client = await this.#sessionProvider.getSession(page);
@@ -591,6 +762,28 @@ export class NetworkCollector extends PageCollector<HTTPRequest> {
             event.requestId,
             event.initiator as RequestInitiator,
           );
+          // Also key by URL+method so getInitiator can recover the initiator
+          // even when the requestId mapping below loses the delivery race.
+          initiatorByKey.set(
+            initiatorKey(event.request.url, event.request.method),
+            event.initiator as RequestInitiator,
+          );
+          // Bound memory: drop oldest entries beyond the cap (Map preserves
+          // insertion order, so the first key is the oldest).
+          while (initiatorMap.size > MAX_INITIATOR_ENTRIES) {
+            const oldest = initiatorMap.keys().next().value;
+            if (oldest === undefined) {
+              break;
+            }
+            initiatorMap.delete(oldest);
+          }
+          while (initiatorByKey.size > MAX_INITIATOR_ENTRIES) {
+            const oldest = initiatorByKey.keys().next().value;
+            if (oldest === undefined) {
+              break;
+            }
+            initiatorByKey.delete(oldest);
+          }
         }
 
         // Map CDP request ID to Playwright Request via URL+method matching
@@ -645,6 +838,8 @@ export class NetworkCollector extends PageCollector<HTTPRequest> {
     }
     this.#cdpListeners.delete(page);
     this.#initiators.delete(page);
+    this.#initiatorsByKey.delete(page);
+    responseBodyBudget.delete(page);
   }
 
   /**
@@ -661,15 +856,27 @@ export class NetworkCollector extends PageCollector<HTTPRequest> {
    * @returns The initiator info or undefined if not found
    */
   getInitiator(page: Page, request: HTTPRequest): RequestInitiator | undefined {
-    const initiatorMap = this.#initiators.get(page);
-    if (!initiatorMap) {
-      return undefined;
-    }
+    // Preferred: exact CDP requestId match (when the mapping won the race).
     const requestId = this.getCdpRequestId(request);
-    if (!requestId) {
+    const byId = requestId
+      ? this.#initiators.get(page)?.get(requestId)
+      : undefined;
+    if (byId) {
+      return byId;
+    }
+
+    // Fallback: URL+method correlation. The requestId mapping requires the
+    // Playwright request to already be in storage when the CDP event fires,
+    // which races against event delivery; this lookup is order-independent.
+    let url: string;
+    let method: string;
+    try {
+      url = request.url();
+      method = request.method();
+    } catch {
       return undefined;
     }
-    return initiatorMap.get(requestId);
+    return this.#initiatorsByKey.get(page)?.get(initiatorKey(url, method));
   }
 
   /**
@@ -683,39 +890,87 @@ export class NetworkCollector extends PageCollector<HTTPRequest> {
     return initiatorMap?.get(requestId);
   }
 
-  override splitAfterNavigation(page: Page) {
-    const navigations = this.storage.get(page) ?? [];
-    if (!navigations) {
+  /**
+   * Append a request to the page's flat FIFO queue. The network collector is
+   * navigation-agnostic: a single bucket (index 0) holds the most recent
+   * MAX_RETAINED_REQUESTS requests. Evicting the oldest reclaims its cached
+   * response body bytes from the per-page budget, so the 50MB budget is a
+   * rolling window, never a one-way ratchet.
+   */
+  protected override store(
+    page: Page,
+    withId: WithSymbolId<HTTPRequest>,
+  ): void {
+    const navigations = this.storage.get(page) ?? [[]];
+    const queue = navigations[0];
+    queue.push(withId);
+    while (queue.length > MAX_RETAINED_REQUESTS) {
+      const evicted = queue.shift();
+      if (evicted) {
+        this.#reclaimResponseBodyBudget(page, [evicted]);
+      }
+    }
+  }
+
+  /**
+   * Navigation does not split or trim the network queue. Requests accumulate in
+   * one FIFO bucket regardless of navigation, so a request that already fired
+   * (e.g. the POST that triggered a redirect) stays inspectable afterwards. The
+   * analyst trims on demand via clear(), not on navigation — see the method doc
+   * and MAX_RETAINED_REQUESTS.
+   */
+  override splitAfterNavigation(_page: Page) {
+    // Intentionally a no-op.
+  }
+
+  /**
+   * Drop all collected requests for a page and release every parallel structure
+   * that tracks them: the cached response body budget and both initiator maps.
+   * Lets the analyst establish a clean baseline before the action they want to
+   * study (the DevTools "clear, then act" workflow). The per-page stable-id
+   * counter lives in a closure in #initializePage and is intentionally out of
+   * reach here, so reqids stay monotonic and are never reused after a clear.
+   */
+  clear(page: Page): {requestCount: number; reclaimedBytes: number} {
+    const navigations = this.storage.get(page);
+    let requestCount = 0;
+    if (navigations) {
+      for (const bucket of navigations) {
+        requestCount += bucket.length;
+      }
+    }
+
+    const budget = responseBodyBudget.get(page);
+    const reclaimedBytes = budget?.bytes ?? 0;
+    if (budget) {
+      budget.bytes = 0;
+    }
+
+    if (navigations) {
+      navigations.length = 1;
+      navigations[0] = [];
+    }
+    this.#initiators.get(page)?.clear();
+    this.#initiatorsByKey.get(page)?.clear();
+
+    return {requestCount, reclaimedBytes};
+  }
+
+  #reclaimResponseBodyBudget(page: Page, evicted: HTTPRequest[]): void {
+    const budget = responseBodyBudget.get(page);
+    if (!budget) {
       return;
     }
-
-    const requests = navigations[0];
-
-    const lastRequestIdx = requests.findLastIndex(request => {
-      try {
-        return request.frame() === page.mainFrame()
-          ? request.isNavigationRequest()
-          : false;
-      } catch {
-        // frame() can throw for service worker requests
-        return false;
+    for (const request of evicted) {
+      const size = (request as RequestWithNetworkMetadata)[
+        responseBodySizeSymbol
+      ];
+      if (typeof size === 'number') {
+        budget.bytes -= size;
       }
-    });
-
-    // Keep all requests since the last navigation request including that
-    // navigation request itself.
-    // Keep the reference
-    if (lastRequestIdx !== -1) {
-      const fromCurrentNavigation = requests.splice(lastRequestIdx);
-      navigations.unshift(fromCurrentNavigation);
-    } else {
-      navigations.unshift([]);
     }
-
-    // Clear old initiator data on navigation
-    const initiatorMap = this.#initiators.get(page);
-    if (initiatorMap) {
-      initiatorMap.clear();
+    if (budget.bytes < 0) {
+      budget.bytes = 0;
     }
   }
 }

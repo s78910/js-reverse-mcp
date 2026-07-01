@@ -27,6 +27,8 @@ import {
   getResponseHeadersArray,
   getShortDescriptionForRequestAsync,
   getSetCookieHeaders,
+  getSetCookieFlowRequestLine,
+  getSetCookieFlowValues,
   getStatusFromRequestAsync,
   isRequestPending,
 } from './formatters/networkFormatter.js';
@@ -53,9 +55,10 @@ export class McpResponse implements Response {
   #networkRequestsOptions?: {
     include: boolean;
     pagination?: PaginationOptions;
+    methods?: string[];
     resourceTypes?: string[];
     urlFilter?: string;
-    includePreservedRequests?: boolean;
+    cookieName?: string;
     networkRequestIdInDevToolsUI?: number;
   };
   #consoleDataOptions?: {
@@ -79,9 +82,10 @@ export class McpResponse implements Response {
   setIncludeNetworkRequests(
     value: boolean,
     options?: PaginationOptions & {
+      methods?: string[];
       resourceTypes?: string[];
       urlFilter?: string;
-      includePreservedRequests?: boolean;
+      cookieName?: string;
       networkRequestIdInDevToolsUI?: number;
     },
   ): void {
@@ -99,9 +103,10 @@ export class McpResponse implements Response {
               pageIdx: options.pageIdx,
             }
           : undefined,
+      methods: options?.methods,
       resourceTypes: options?.resourceTypes,
       urlFilter: options?.urlFilter,
-      includePreservedRequests: options?.includePreservedRequests,
+      cookieName: options?.cookieName,
       networkRequestIdInDevToolsUI: options?.networkRequestIdInDevToolsUI,
     };
   }
@@ -404,9 +409,19 @@ export class McpResponse implements Response {
     response.push(...this.#formatConsoleData(data.consoleData));
 
     if (this.#networkRequestsOptions?.include) {
-      let requests = context.getNetworkRequests(
-        this.#networkRequestsOptions?.includePreservedRequests,
-      );
+      let requests = context.getNetworkRequests();
+
+      // Apply HTTP method filtering if specified (case-insensitive)
+      if (this.#networkRequestsOptions.methods?.length) {
+        const normalizedMethods = new Set(
+          this.#networkRequestsOptions.methods.map(method =>
+            method.toUpperCase(),
+          ),
+        );
+        requests = requests.filter(request =>
+          normalizedMethods.has(request.method().toUpperCase()),
+        );
+      }
 
       // Apply resource type filtering if specified
       if (this.#networkRequestsOptions.resourceTypes?.length) {
@@ -428,29 +443,78 @@ export class McpResponse implements Response {
         );
       }
 
-      // Show newest requests first
-      requests.reverse();
-
-      response.push('## Network requests');
-      if (requests.length) {
-        const data = this.#dataWithPagination(
-          requests,
-          this.#networkRequestsOptions.pagination ?? {pageSize: 20, pageIdx: 0},
-        );
-        response.push(...data.info);
-        for (const request of data.items) {
-          response.push(
-            await getShortDescriptionForRequestAsync(
+      const cookieName = this.#networkRequestsOptions.cookieName;
+      if (cookieName) {
+        const flowEntries = (
+          await Promise.all(
+            requests.map(async request => ({
               request,
-              context.getNetworkRequestStableId(request),
-              context.getNetworkRequestStableId(request) ===
-                this.#networkRequestsOptions?.networkRequestIdInDevToolsUI,
-              true,
-            ),
+              setCookieValues: await getSetCookieFlowValues(
+                request,
+                cookieName,
+              ),
+            })),
+          )
+        ).filter(({setCookieValues}) => setCookieValues.length);
+
+        response.push(`## Set-Cookie flow for ${cookieName}`);
+        response.push('Matched response Set-Cookie updates, oldest first.');
+        response.push(
+          'Pagination ignored: Set-Cookie flow shows all matching updates in the current captured queue.',
+        );
+        response.push(
+          'Coverage: current captured network queue only; earlier updates may be missing if capture started late or the FIFO queue rolled over.',
+        );
+        if (flowEntries.length) {
+          const updateLabel =
+            flowEntries.length === 1 ? 'request update' : 'request updates';
+          response.push(`${flowEntries.length} ${updateLabel}`);
+          for (const {request, setCookieValues} of flowEntries) {
+            response.push(
+              await getSetCookieFlowRequestLine(
+                request,
+                context.getNetworkRequestStableId(request),
+                context.getNetworkRequestStableId(request) ===
+                  this.#networkRequestsOptions?.networkRequestIdInDevToolsUI,
+              ),
+            );
+            for (const setCookieValue of setCookieValues) {
+              response.push(`set-cookie: ${setCookieValue}`);
+            }
+          }
+        } else {
+          response.push(
+            'No Set-Cookie updates found for this cookie in the current captured network queue.',
           );
         }
       } else {
-        response.push('No requests found.');
+        // Show newest requests first
+        requests.reverse();
+
+        response.push('## Network requests');
+        if (requests.length) {
+          const data = this.#dataWithPagination(
+            requests,
+            this.#networkRequestsOptions.pagination ?? {
+              pageSize: 20,
+              pageIdx: 0,
+            },
+          );
+          response.push(...data.info);
+          for (const request of data.items) {
+            response.push(
+              await getShortDescriptionForRequestAsync(
+                request,
+                context.getNetworkRequestStableId(request),
+                context.getNetworkRequestStableId(request) ===
+                  this.#networkRequestsOptions?.networkRequestIdInDevToolsUI,
+                true,
+              ),
+            );
+          }
+        } else {
+          response.push('No requests found.');
+        }
       }
     }
 
