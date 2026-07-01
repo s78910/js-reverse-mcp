@@ -14,6 +14,9 @@ import {
   formatConsoleEventVerbose,
 } from './formatters/consoleFormatter.js';
 import {
+  cookieRelationMatches,
+  getCookieRelationMarker,
+  getCookieRelationMatch,
   getFormattedHeaderEntries,
   getFormattedResponseBody,
   getFormattedRequestBody,
@@ -30,6 +33,10 @@ import {
   getStatusFromRequestAsync,
   isRequestPending,
 } from './formatters/networkFormatter.js';
+import type {
+  CookieRelation,
+  CookieRelationMatch,
+} from './formatters/networkFormatter.js';
 import {
   formatWebSocketConnectionShort,
   formatWebSocketConnectionVerbose,
@@ -37,6 +44,7 @@ import {
 import type {McpContext} from './McpContext.js';
 import type {
   ConsoleMessage,
+  HTTPRequest,
   ImageContent,
   TextContent,
 } from './third_party/index.js';
@@ -56,6 +64,8 @@ export class McpResponse implements Response {
     methods?: string[];
     resourceTypes?: string[];
     urlFilter?: string;
+    cookieName?: string;
+    cookieRelation?: CookieRelation;
     networkRequestIdInDevToolsUI?: number;
   };
   #consoleDataOptions?: {
@@ -82,6 +92,8 @@ export class McpResponse implements Response {
       methods?: string[];
       resourceTypes?: string[];
       urlFilter?: string;
+      cookieName?: string;
+      cookieRelation?: CookieRelation;
       networkRequestIdInDevToolsUI?: number;
     },
   ): void {
@@ -102,6 +114,8 @@ export class McpResponse implements Response {
       methods: options?.methods,
       resourceTypes: options?.resourceTypes,
       urlFilter: options?.urlFilter,
+      cookieName: options?.cookieName,
+      cookieRelation: options?.cookieRelation,
       networkRequestIdInDevToolsUI: options?.networkRequestIdInDevToolsUI,
     };
   }
@@ -438,10 +452,40 @@ export class McpResponse implements Response {
         );
       }
 
+      const cookieMatches = new Map<HTTPRequest, CookieRelationMatch>();
+      const cookieName = this.#networkRequestsOptions.cookieName;
+      const cookieRelation =
+        this.#networkRequestsOptions.cookieRelation ?? 'updates';
+      if (cookieName) {
+        const requestsWithCookieMatches = await Promise.all(
+          requests.map(async request => ({
+            request,
+            match: await getCookieRelationMatch(
+              request,
+              cookieName,
+              cookieRelation,
+            ),
+          })),
+        );
+        requests = requestsWithCookieMatches
+          .filter(({match}) => cookieRelationMatches(match, cookieRelation))
+          .map(({request, match}) => {
+            cookieMatches.set(request, match);
+            return request;
+          });
+      }
+
       // Show newest requests first
       requests.reverse();
 
-      response.push('## Network requests');
+      response.push(
+        cookieName
+          ? `## Network requests for cookie ${cookieName}`
+          : '## Network requests',
+      );
+      if (cookieName) {
+        response.push(`Matched relation: ${cookieRelation}`);
+      }
       if (requests.length) {
         const data = this.#dataWithPagination(
           requests,
@@ -455,7 +499,16 @@ export class McpResponse implements Response {
               context.getNetworkRequestStableId(request),
               context.getNetworkRequestStableId(request) ===
                 this.#networkRequestsOptions?.networkRequestIdInDevToolsUI,
-              true,
+              !cookieName,
+              cookieName
+                ? getCookieRelationMarker(
+                    cookieMatches.get(request) ?? {
+                      sends: false,
+                      updates: false,
+                    },
+                    cookieName,
+                  )
+                : '',
             ),
           );
         }

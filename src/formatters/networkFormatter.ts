@@ -62,6 +62,13 @@ export type NetworkExportPart =
   | 'requestBody'
   | 'queryParams';
 
+export type CookieRelation = 'updates' | 'sends' | 'all';
+
+export interface CookieRelationMatch {
+  sends: boolean;
+  updates: boolean;
+}
+
 interface QueryPayload {
   queryString: string;
   params: Record<string, string | string[]>;
@@ -164,16 +171,17 @@ export async function getShortDescriptionForRequestAsync(
   id: number,
   selectedInDevToolsUI = false,
   includeSetCookieMarker = false,
+  extraMarker = '',
 ): Promise<string> {
   if (!hasFinishedOrFailed(request)) {
-    return `reqid=${id} ${getFormattedRequestTimingBrief(request)} [${request.resourceType()}] ${request.method()} ${getUrlForList(request.url())} ${getPendingRequestStatus()}${selectedInDevToolsUI ? ` [selected in the DevTools Network panel]` : ''}`;
+    return `reqid=${id} ${getFormattedRequestTimingBrief(request)} [${request.resourceType()}] ${request.method()} ${getUrlForList(request.url())} ${getPendingRequestStatus()}${extraMarker}${selectedInDevToolsUI ? ` [selected in the DevTools Network panel]` : ''}`;
   }
 
   const status = await getStatusFromRequestAsync(request);
   const setCookieMarker = includeSetCookieMarker
     ? await getSetCookieListMarker(request)
     : '';
-  return `reqid=${id} ${getFormattedRequestTimingBrief(request)} [${request.resourceType()}] ${request.method()} ${getUrlForList(request.url())} ${status}${setCookieMarker}${selectedInDevToolsUI ? ` [selected in the DevTools Network panel]` : ''}`;
+  return `reqid=${id} ${getFormattedRequestTimingBrief(request)} [${request.resourceType()}] ${request.method()} ${getUrlForList(request.url())} ${status}${setCookieMarker}${extraMarker}${selectedInDevToolsUI ? ` [selected in the DevTools Network panel]` : ''}`;
 }
 
 function hasFinishedOrFailed(request: HTTPRequest): boolean {
@@ -316,6 +324,54 @@ export function getFormattedSetCookieEntries(
     `${setCookieHeaders.length} ${entryLabel}`,
     ...setCookieHeaders.map(formatSetCookieNameValue),
   ];
+}
+
+export async function getCookieRelationMatch(
+  request: HTTPRequest,
+  cookieName: string,
+  relation: CookieRelation,
+): Promise<CookieRelationMatch> {
+  const match: CookieRelationMatch = {
+    sends: false,
+    updates: false,
+  };
+
+  if (relation !== 'updates') {
+    match.sends = await requestSendsCookie(request, cookieName);
+  }
+
+  if (relation !== 'sends') {
+    match.updates = await requestUpdatesCookie(request, cookieName);
+  }
+
+  return match;
+}
+
+export function cookieRelationMatches(
+  match: CookieRelationMatch,
+  relation: CookieRelation,
+): boolean {
+  if (relation === 'updates') {
+    return match.updates;
+  }
+  if (relation === 'sends') {
+    return match.sends;
+  }
+  return match.updates || match.sends;
+}
+
+export function getCookieRelationMarker(
+  match: CookieRelationMatch,
+  cookieName: string,
+): string {
+  const markers: string[] = [];
+  if (match.sends) {
+    markers.push(`sends-cookie: ${cookieName}`);
+  }
+  if (match.updates) {
+    markers.push(`sets-cookie: ${cookieName}`);
+  }
+  return markers.length ? ` ${markers.join(' ')}` : '';
 }
 
 export async function getFormattedResponseBody(
@@ -1050,6 +1106,35 @@ async function getSetCookieListMarker(request: HTTPRequest): Promise<string> {
 
 function getSetCookieName(setCookieHeader: string): string {
   return parseSetCookieNameValue(setCookieHeader)?.name ?? '<unnamed>';
+}
+
+async function requestSendsCookie(
+  request: HTTPRequest,
+  cookieName: string,
+): Promise<boolean> {
+  const requestHeaders = await getRequestHeadersArray(request).catch(() => []);
+  return requestHeaders.some(
+    ({name, value}) =>
+      name.toLowerCase() === 'cookie' &&
+      getCookieHeaderNames(value).includes(cookieName),
+  );
+}
+
+async function requestUpdatesCookie(
+  request: HTTPRequest,
+  cookieName: string,
+): Promise<boolean> {
+  const httpResponse = await getResponseIfCompleted(request);
+  if (!httpResponse) {
+    return false;
+  }
+
+  const responseHeaders = await getResponseHeadersArray(httpResponse).catch(
+    () => [],
+  );
+  return getSetCookieHeaders(responseHeaders).some(
+    setCookieHeader => getSetCookieName(setCookieHeader) === cookieName,
+  );
 }
 
 function formatSetCookieNameValue(setCookieHeader: string): string {

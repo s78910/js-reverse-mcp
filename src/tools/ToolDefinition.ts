@@ -5,6 +5,7 @@
  */
 
 import type {DebuggerContext} from '../DebuggerContext.js';
+import type {CookieRelation} from '../formatters/networkFormatter.js';
 import type {TrafficSummary} from '../formatters/websocketFormatter.js';
 import type {RequestInitiator} from '../PageCollector.js';
 import {zod} from '../third_party/index.js';
@@ -59,6 +60,8 @@ export interface Response {
       methods?: string[];
       resourceTypes?: string[];
       urlFilter?: string;
+      cookieName?: string;
+      cookieRelation?: CookieRelation;
       networkRequestIdInDevToolsUI?: number;
     },
   ): void;

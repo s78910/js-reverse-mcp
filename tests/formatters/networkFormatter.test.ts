@@ -8,7 +8,10 @@ import assert from 'node:assert/strict';
 import {test} from 'node:test';
 
 import {
+  cookieRelationMatches,
   exportNetworkRequestPart,
+  getCookieRelationMarker,
+  getCookieRelationMatch,
   getFormattedHeaderEntries,
   getFormattedResponseBody,
   getFormattedSetCookieEntries,
@@ -65,6 +68,33 @@ test('formats Set-Cookie entries as name=value and omits long values', () => {
     ]),
     ['2 entries', '- sid=abc123', '- risk=<omitted; value length 513 chars>'],
   );
+});
+
+test('matches requests that send or update a named cookie', async () => {
+  const request = createCookieRequest({
+    requestCookie: 'sid=abc; theme=light',
+    setCookieHeaders: ['sid=def; Path=/', 'risk=xyz; Path=/'],
+  });
+
+  const sidAll = await getCookieRelationMatch(request, 'sid', 'all');
+  assert.deepEqual(sidAll, {sends: true, updates: true});
+  assert.equal(cookieRelationMatches(sidAll, 'all'), true);
+  assert.equal(
+    getCookieRelationMarker(sidAll, 'sid'),
+    ' sends-cookie: sid sets-cookie: sid',
+  );
+
+  const riskUpdates = await getCookieRelationMatch(request, 'risk', 'updates');
+  assert.deepEqual(riskUpdates, {sends: false, updates: true});
+  assert.equal(cookieRelationMatches(riskUpdates, 'updates'), true);
+
+  const themeSends = await getCookieRelationMatch(request, 'theme', 'sends');
+  assert.deepEqual(themeSends, {sends: true, updates: false});
+  assert.equal(cookieRelationMatches(themeSends, 'sends'), true);
+
+  const missing = await getCookieRelationMatch(request, 'missing', 'all');
+  assert.deepEqual(missing, {sends: false, updates: false});
+  assert.equal(cookieRelationMatches(missing, 'all'), false);
 });
 
 test('formats pending request list entries without waiting for a response', async () => {
@@ -230,5 +260,46 @@ function createPendingRequest(): HTTPRequest {
       responseEnd: -1,
     }),
     url: () => 'https://example.test/api?a=1',
+  } as unknown as HTTPRequest;
+}
+
+function createCookieRequest(opts: {
+  requestCookie?: string;
+  setCookieHeaders?: string[];
+}): HTTPRequest {
+  const requestHeaders = opts.requestCookie
+    ? [{name: 'Cookie', value: opts.requestCookie}]
+    : [];
+  const responseHeaders = (opts.setCookieHeaders ?? []).map(value => ({
+    name: 'Set-Cookie',
+    value,
+  }));
+
+  const response = {
+    headers: () => ({}),
+    headersArray: async () => responseHeaders,
+    status: () => 200,
+    statusText: () => 'OK',
+  } as unknown as HTTPResponse;
+
+  return {
+    failure: () => null,
+    headers: () => (opts.requestCookie ? {cookie: opts.requestCookie} : {}),
+    headersArray: async () => requestHeaders,
+    method: () => 'GET',
+    resourceType: () => 'xhr',
+    response: async () => response,
+    timing: () => ({
+      startTime: 0,
+      domainLookupStart: -1,
+      domainLookupEnd: -1,
+      connectStart: -1,
+      secureConnectionStart: -1,
+      connectEnd: -1,
+      requestStart: 1,
+      responseStart: 2,
+      responseEnd: 3,
+    }),
+    url: () => 'https://example.test/api',
   } as unknown as HTTPRequest;
 }
